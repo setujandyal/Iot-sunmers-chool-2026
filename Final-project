@@ -1,1 +1,221 @@
+code for ESP32 
+
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "HX711.h"
+
+// ---------------- CONFIG ----------------
+#define DEMO_MODE true          // set to false once wired + calibrated
+
+const char* AP_SSID = "GasGuard-Monitor";
+const char* AP_PASS = "gasguard123";   // must be at least 8 characters
+
+const int HX711_DT_PIN  = 4;
+const int HX711_SCK_PIN = 5;
+
+// Replace these after running the calibration steps at the bottom of this file.
+float CALIBRATION_FACTOR = -7050.0;   // converts raw HX711 reading to grams
+float TARE_OFFSET_G      = 0.0;       // small correction if tare isn't perfectly 0
+
+// ---------------- GLOBALS ----------------
+WebServer server(80);
+HX711 scale;
+float lastWeightG = 0.0;
+
+// ---------------- DASHBOARD PAGE (embedded) ----------------
+// This is the same page as index.html — kept in sync manually.
+// If you edit index.html's look and feel, copy the relevant CSS/JS changes here too.
+const char DASHBOARD_HTML[] PROGMEM = R"HTMLPAGE(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GasGuard Monitor</title>
+<style>
+  :root{ --bg:#14171a; --panel:#1e2328; --panel-2:#262c32; --divider:#2a2f35;
+    --text:#e8e6e1; --text-muted:#8b939b; --amber:#f2a541; --green:#3ddc97; --red:#e2483d; }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;min-height:100vh;}
+  .mono{font-family:ui-monospace,"SF Mono","Cascadia Code","Roboto Mono",monospace;}
+  .wrap{max-width:460px;margin:0 auto;padding:20px 18px 40px;}
+  .topbar{display:flex;align-items:center;justify-content:space-between;
+    padding-bottom:14px;border-bottom:1px solid var(--divider);margin-bottom:22px;}
+  .eyebrow{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--text-muted);font-weight:600;}
+  .status{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);}
+  .dot.offline{background:var(--red);box-shadow:0 0 6px var(--red);}
+  .gauge-card{background:linear-gradient(180deg,var(--panel-2),var(--panel));
+    border:1px solid var(--divider);border-radius:18px;padding:22px 18px 10px;
+    display:flex;flex-direction:column;align-items:center;}
+  .gauge-label{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:6px;}
+  svg#gauge{width:100%;max-width:320px;height:auto;}
+  .gauge-readout{margin-top:-64px;text-align:center;}
+  .gauge-readout .pct{font-size:46px;font-weight:600;line-height:1;}
+  .gauge-readout .pct .unit{font-size:20px;color:var(--text-muted);margin-left:2px;}
+  .gauge-readout .sub{font-size:12px;color:var(--text-muted);margin-top:4px;}
+  .stats{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px;}
+  .stat{background:var(--panel);border:1px solid var(--divider);border-radius:14px;padding:14px 16px;}
+  .stat .label{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-muted);margin-bottom:6px;}
+  .stat .value{font-size:22px;font-weight:600;}
+  .stat .value .u{font-size:13px;color:var(--text-muted);font-weight:400;margin-left:3px;}
+  .trend-card{background:var(--panel);border:1px solid var(--divider);border-radius:14px;padding:16px;margin-top:12px;}
+  .trend-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;}
+  .trend-head .label{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-muted);}
+  .trend-head .rate{font-size:12px;color:var(--text-muted);}
+  canvas#trend{width:100%;height:70px;display:block;}
+  .footer{margin-top:18px;text-align:center;font-size:10.5px;color:var(--text-muted);letter-spacing:.04em;}
+  .alert-banner{display:none;margin-top:14px;padding:10px 14px;border-radius:10px;font-size:12.5px;font-weight:600;text-align:center;}
+  .alert-banner.low{display:block;background:rgba(242,165,65,.12);border:1px solid rgba(242,165,65,.4);color:var(--amber);}
+  .alert-banner.critical{display:block;background:rgba(226,72,61,.12);border:1px solid rgba(226,72,61,.4);color:var(--red);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="eyebrow">GasGuard Monitor</div>
+    <div class="status"><div class="dot" id="statusDot"></div><span id="statusText">Live</span></div>
+  </div>
+  <div class="gauge-card">
+    <div class="gauge-label">Remaining</div>
+    <svg id="gauge" viewBox="0 0 320 190">
+      <path d="M 30 170 A 130 130 0 0 1 88.8 60.2" fill="none" stroke="#e2483d" stroke-width="16" stroke-linecap="round" opacity="0.9"/>
+      <path d="M 88.8 60.2 A 130 130 0 0 1 160 40" fill="none" stroke="#f2a541" stroke-width="16" stroke-linecap="round" opacity="0.9"/>
+      <path d="M 160 40 A 130 130 0 0 1 290 170" fill="none" stroke="#3ddc97" stroke-width="16" stroke-linecap="round" opacity="0.9"/>
+      <g id="needleGroup" style="transform-origin:160px 170px;">
+        <line id="needle" x1="160" y1="170" x2="160" y2="55" stroke="#e8e6e1" stroke-width="3.5" stroke-linecap="round"/>
+      </g>
+      <circle cx="160" cy="170" r="9" fill="#e8e6e1"/>
+      <circle cx="160" cy="170" r="4" fill="#14171a"/>
+    </svg>
+    <div class="gauge-readout">
+      <div class="pct"><span id="pctValue" class="mono">--</span><span class="unit">%</span></div>
+      <div class="sub" id="weightSub">-- g on load cell</div>
+    </div>
+    <div class="alert-banner" id="alertBanner"></div>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="label">Est. Time Left</div>
+      <div class="value mono"><span id="daysValue">--</span><span class="u">hrs</span></div></div>
+    <div class="stat"><div class="label">Usage Rate</div>
+      <div class="value mono"><span id="rateValue">--</span><span class="u">g/hr</span></div></div>
+  </div>
+  <div class="trend-card">
+    <div class="trend-head"><div class="label">Weight Trend</div><div class="rate" id="trendRange">last readings</div></div>
+    <canvas id="trend" width="600" height="140"></canvas>
+  </div>
+  <div class="footer" id="footerText">Waiting for first reading&hellip;</div>
+</div>
+<script>
+  const EMPTY_WEIGHT_G = 50;
+  const FULL_WEIGHT_G  = 1050;
+  const POLL_MS = 3000;
+  const pctValue=document.getElementById('pctValue'), weightSub=document.getElementById('weightSub'),
+    daysValue=document.getElementById('daysValue'), rateValue=document.getElementById('rateValue'),
+    needleGroup=document.getElementById('needleGroup'), statusDot=document.getElementById('statusDot'),
+    statusText=document.getElementById('statusText'), alertBanner=document.getElementById('alertBanner'),
+    footerText=document.getElementById('footerText'), trendCanvas=document.getElementById('trend'),
+    ctx=trendCanvas.getContext('2d');
+  let history=[];
+  function setNeedle(p){ needleGroup.style.transform = `rotate(${-90+(p/100)*180}deg)`; }
+  function updateAlert(p){
+    if(p<=10){alertBanner.className='alert-banner critical';alertBanner.textContent='Critical: nearly empty';}
+    else if(p<=25){alertBanner.className='alert-banner low';alertBanner.textContent='Running low';}
+    else{alertBanner.className='alert-banner';alertBanner.textContent='';}
+  }
+  function drawTrend(){
+    const w=trendCanvas.width,h=trendCanvas.height; ctx.clearRect(0,0,w,h);
+    if(history.length<2) return;
+    const weights=history.map(p=>p.weight), max=Math.max(...weights), min=Math.min(...weights), range=(max-min)||1;
+    const stepX=w/(history.length-1);
+    ctx.beginPath();
+    history.forEach((p,i)=>{const x=i*stepX, y=h-((p.weight-min)/range)*(h-20)-10; i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
+    ctx.strokeStyle='#3ddc97'; ctx.lineWidth=2; ctx.stroke();
+    ctx.lineTo(w,h); ctx.lineTo(0,h); ctx.closePath(); ctx.fillStyle='rgba(61,220,151,0.08)'; ctx.fill();
+  }
+  function applyReading(data){
+    const weight=data.weight_g;
+    const usableWeight=Math.max(0,Math.min(FULL_WEIGHT_G-EMPTY_WEIGHT_G, weight-EMPTY_WEIGHT_G));
+    const fullRange=FULL_WEIGHT_G-EMPTY_WEIGHT_G;
+    const percent=Math.round((usableWeight/fullRange)*100);
+    pctValue.textContent=percent; weightSub.textContent=`${weight.toFixed(1)} g on load cell`;
+    setNeedle(percent); updateAlert(percent);
+    history.push({t:Date.now(),weight:weight}); if(history.length>40) history.shift();
+    drawTrend();
+    if(history.length>=2){
+      const first=history[0], last=history[history.length-1];
+      const hoursElapsed=(last.t-first.t)/3600000, gramsUsed=first.weight-last.weight;
+      if(hoursElapsed>0.01 && gramsUsed>0){
+        const ratePerHour=gramsUsed/hoursElapsed;
+        rateValue.textContent=ratePerHour.toFixed(1);
+        daysValue.textContent= ratePerHour>0 ? Math.max(0,Math.round(usableWeight/ratePerHour)) : '--';
+      } else { rateValue.textContent='0.0'; daysValue.textContent='--'; }
+    }
+    footerText.textContent=`Last updated ${new Date().toLocaleTimeString()}`;
+    statusDot.className='dot'; statusText.textContent='Live';
+  }
+  async function poll(){
+    try{
+      const res=await fetch('/data',{cache:'no-store'});
+      if(!res.ok) throw new Error('bad response');
+      applyReading(await res.json());
+    }catch(err){ statusDot.className='dot offline'; statusText.textContent='Offline'; }
+  }
+  poll(); setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
+)HTMLPAGE";
+
+// ---------------- HANDLERS ----------------
+void handleRoot() {
+  server.send_P(200, "text/html", DASHBOARD_HTML);
+}
+
+float readWeightGrams() {
+  if (DEMO_MODE) {
+    float t = millis() / 1000.0;
+    return 50 + (1050 - 50) * 0.6 + sin(t / 30.0) * 5 - fmod(t, 6000.0) / 20.0;
+  }
+  if (scale.is_ready()) {
+    lastWeightG = scale.get_units(5) + TARE_OFFSET_G;  // average of 5 readings
+    return lastWeightG;
+  }
+  return lastWeightG; // last known good value if HX711 isn't responding this cycle
+}
+
+void handleData() {
+  float weight = readWeightGrams();
+  String json = "{";
+  json += "\"weight_g\":" + String(weight, 2) + ",";
+  json += "\"timestamp\":" + String(millis());
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  if (!DEMO_MODE) {
+    scale.begin(HX711_DT_PIN, HX711_SCK_PIN);
+    scale.set_scale(CALIBRATION_FACTOR);
+    scale.tare(); // do this with the platform empty, nothing touching it
+  }
+
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.print("Access Point started: ");
+  Serial.println(AP_SSID);
+  Serial.print("Open in browser: http://");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
 
